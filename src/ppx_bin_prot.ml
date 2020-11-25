@@ -1445,6 +1445,12 @@ let bin_read =
     ~str_type_decl:Generate_bin_read.gen
     ~sig_type_decl:Sig.bin_read
 
+let bin_read_safe =
+  Deriving.add
+    "bin_read_safe"
+    ~str_type_decl:Generate_bin_read.gen
+    ~sig_type_decl:Sig.bin_read
+
 let () =
   Deriving.add
     "bin_reader"
@@ -1465,5 +1471,11 @@ let bin_io_named_sig =
 let bin_io =
   let set = [bin_shape; bin_write; bin_read; bin_type_class] in
   Deriving.add_alias "bin_io" set
+    ~sig_type_decl:[bin_io_named_sig]
+    ~str_type_decl:(List.rev set)
+
+let bin_io_safe =
+  let set = [bin_shape; bin_write; bin_read_safe; bin_type_class] in
+  Deriving.add_alias "bin_io_safe" set
     ~sig_type_decl:[bin_io_named_sig]
     ~str_type_decl:(List.rev set)

@@ -7,11 +7,27 @@ open Ast_builder.Default
 let ( @@ ) a b = a b
 
 (* for debugging *)
-let print_expr s expr =
-  Stdio.printf "%s\n%!" s;
-  Pprintast.expression Caml.Format.std_formatter expr;
-  Caml.Format.pp_print_flush Caml.Format.std_formatter ();
-  Stdio.printf "\n%!"
+let mk_ast_print ~f =
+  (fun s item ->
+     Stdio.printf "%s\n%!" s;
+     f Caml.Format.std_formatter item;
+     Caml.Format.pp_print_flush Caml.Format.std_formatter ();
+     Stdio.printf "\n%!")
+
+let print_expr = mk_ast_print ~f:Pprintast.expression
+
+let print_patt = mk_ast_print ~f:Pprintast.pattern
+
+let print_core_type = mk_ast_print ~f:Pprintast.core_type
+
+let print_struct_item = mk_ast_print ~f:Pprintast.structure_item
+
+let print_type_decl s ty_decl =
+  let item = {pstr_desc= Pstr_type (Ast.Recursive, [ty_decl]); pstr_loc= Location.none}
+  in
+  print_struct_item s item
+
+let _ = print_expr, print_patt, print_core_type, print_struct_item, print_type_decl
 
 (* +-----------------------------------------------------------------+
    | Signature generators                                            |
@@ -1393,21 +1409,21 @@ module Generate_bin_read_safe = struct
               (try
                 Ok ([%e expr] buf ~pos_ref)
               with exn ->
-                Error (Exn.to_string exn))]
+                Error (Error.of_string (Exn.to_string exn)))]
           | `Open body -> [%expr fun buf ~pos_ref ->
             try
               Ok ([%e body])
             with exn ->
-              Error (Exn.to_string exn)
+              Error (Error.of_string (Exn.to_string exn))
           ]
       in
-      print_expr "BODY" body;
       let pat = pvar ~loc read_name in
       let pat_with_type =
         match read_binding_type with
         | None -> pat
         | Some ty -> ppat_constraint ~loc pat ty
       in
+      print_patt "PAT W/ TYPE" pat_with_type;
       value_binding ~loc
         ~pat:pat_with_type
         ~expr:(eabstract ~loc (patts_of_vars args) body)
@@ -1432,14 +1448,17 @@ module Generate_bin_read_safe = struct
     let oc_body = Generate_bin_read.reader_body_of_td td full_type_name in
     let read_name      =   "bin_read_" ^ td.ptype_name.txt        in
     let vtag_read_name = "__bin_read_" ^ td.ptype_name.txt ^ "__" in
+    print_type_decl "TY DECL" td;
     let vtag_read_binding_type, read_binding_type =
       if can_omit_type_annot then
         None, None
       else
         Some (generate_poly_type ~loc td "Bin_prot.Read.reader"
-                ~wrap_result:(fun ~loc t -> [%type: int -> [%t t]])),
-        Some (generate_poly_type ~loc td "Bin_prot.Read.reader")
+                ~wrap_result:(fun ~loc t -> [%type: int -> [%t t] Or_error.t])),
+        Some (generate_poly_type ~loc td "Bin_prot.Read.reader"
+                ~wrap_result:(fun ~loc t -> [%type: [%t t] Or_error.t]))
     in
+    print_core_type "READ BIND TY" (Option.value_exn read_binding_type);
     let read_binding, vtag_read_binding =
       let args = vars_of_params td ~prefix:"_of__" in
       read_and_vtag_read_bindings ~loc ~read_name ~read_binding_type
@@ -1456,7 +1475,7 @@ module Generate_bin_read_safe = struct
           try
             Ok ([%e call] buf ~pos_ref)
           with exn ->
-            Error (Exn.to_string exn)]
+            Error (Error.of_string (Exn.to_string exn))]
     in
     let vtag_read =
       let call = project_vars (evar ~loc vtag_read_name) vars ~field_name:"read" in

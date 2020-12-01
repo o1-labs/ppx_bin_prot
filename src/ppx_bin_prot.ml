@@ -6,6 +6,13 @@ open Ast_builder.Default
 
 let ( @@ ) a b = a b
 
+(* for debugging *)
+let print_expr s expr =
+  Stdio.printf "%s\n%!" s;
+  Pprintast.expression Caml.Format.std_formatter expr;
+  Caml.Format.pp_print_flush Caml.Format.std_formatter ();
+  Stdio.printf "\n%!"
+
 (* +-----------------------------------------------------------------+
    | Signature generators                                            |
    +-----------------------------------------------------------------+ *)
@@ -58,6 +65,15 @@ module Sig = struct
       ; mk "bin_reader_%s"   "Bin_prot.Type_class.reader"
       ]
 
+  (* O(1) *)
+  let bin_read_safe =
+    mk_sig_generator
+      [ mk "bin_read_%s"     "Bin_prot.Read.reader"
+      ; mk                   "__bin_read_%s__" "Bin_prot.Read.reader"
+          ~wrap_result:(fun ~loc t -> [%type: int -> [%t t]])
+      ; mk "bin_reader_%s"   "Bin_prot.Type_class.reader"
+      ]
+
   let bin_type_class =
     mk_sig_generator
       [ mk "bin_%s" "Bin_prot.Type_class.t" ]
@@ -76,6 +92,23 @@ module Sig = struct
           ~f:(fun gen -> Deriving.Generator.apply ~name:"unused" gen ~ctxt (rf, tds) [])
     in
     Deriving.Generator.V2.make Deriving.Args.empty mk_named_sig
+
+  (* O(1) *)
+  let named_safe =
+    let mk_named_sig ~ctxt (rf, tds) =
+      let loc = Expansion_context.Deriver.derived_item_loc ctxt in
+      match
+        mk_named_sig ~loc ~sg_name:"Bin_prot.Binable.S"
+              ~handle_polymorphic_variant:true tds
+      with
+      | Some incl -> [psig_include ~loc incl]
+      | None ->
+        List.concat_map
+          [ Bin_shape_expand.sig_gen; bin_write; bin_read_safe; bin_type_class ]
+          ~f:(fun gen -> Deriving.Generator.apply ~name:"unused" gen ~ctxt (rf, tds) [])
+    in
+    Deriving.Generator.V2.make Deriving.Args.empty mk_named_sig
+
 end
 
 (* +-----------------------------------------------------------------+
@@ -1221,9 +1254,19 @@ module Generate_bin_read = struct
         | Alias_but_not_polymorphic_variant | Other ->
           match oc_body with
           | `Closed expr ->
-            alias_or_fun expr [%expr fun buf ~pos_ref -> [%e expr] buf ~pos_ref ]
-          | `Open body -> [%expr fun buf ~pos_ref -> [%e body] ]
+            alias_or_fun expr [%expr fun buf ~pos_ref ->
+              (try
+                Ok ([%e expr] buf ~pos_ref)
+              with exn ->
+                Error (Exn.to_string exn))]
+          | `Open body -> [%expr fun buf ~pos_ref ->
+            try
+              Ok ([%e body])
+            with exn ->
+              Error (Exn.to_string exn)
+          ]
       in
+      print_expr "BODY" body;
       let pat = pvar ~loc read_name in
       let pat_with_type =
         match read_binding_type with
@@ -1340,6 +1383,81 @@ module Generate_bin_read = struct
   ;;
 end
 
+module Generate_bin_read_safe = struct
+  let bin_read_td ~can_omit_type_annot ~loc:_ ~path td =
+    let full_type_name = Full_type_name.make ~path td in
+    let loc = td.ptype_loc in
+    let oc_body = Generate_bin_read.reader_body_of_td td full_type_name in
+    let read_name      =   "bin_read_" ^ td.ptype_name.txt        in
+    let vtag_read_name = "__bin_read_" ^ td.ptype_name.txt ^ "__" in
+    let vtag_read_binding_type, read_binding_type =
+      if can_omit_type_annot then
+        None, None
+      else
+        Some (generate_poly_type ~loc td "Bin_prot.Read.reader"
+                ~wrap_result:(fun ~loc t -> [%type: int -> [%t t]])),
+        Some (generate_poly_type ~loc td "Bin_prot.Read.reader")
+    in
+    let read_binding, vtag_read_binding =
+      let args = vars_of_params td ~prefix:"_of__" in
+      Generate_bin_read.read_and_vtag_read_bindings ~loc ~read_name ~read_binding_type
+        ~vtag_read_name ~vtag_read_binding_type
+        ~full_type_name ~td_class:(Generate_bin_read.Td_class.of_td td) ~args ~oc_body
+    in
+    let vars = vars_of_params td ~prefix:"bin_reader_" in
+    let read =
+      let call = project_vars (evar ~loc read_name) vars ~field_name:"read" in
+      (* O(1) changes *)
+      (* an alias is already wrapped *)
+      alias_or_fun call
+        [%expr fun buf ~pos_ref ->
+          try
+            Ok ([%e call] buf ~pos_ref)
+          with exn ->
+            Error (Exn.to_string exn)]
+    in
+    let vtag_read =
+      let call = project_vars (evar ~loc vtag_read_name) vars ~field_name:"read" in
+      alias_or_fun call [%expr fun buf ~pos_ref vtag -> [%e call] buf ~pos_ref vtag ]
+    in
+    let reader = Generate_bin_read.reader_type_class_record ~loc ~read ~vtag_read in
+    let reader_binding =
+      value_binding ~loc
+        ~pat:(pvar ~loc @@ "bin_reader_" ^ td.ptype_name.txt)
+        ~expr:(eabstract ~loc (patts_of_vars vars) reader)
+    in
+    (vtag_read_binding, (read_binding, reader_binding))
+
+  (* Generate code from type definitions *)
+  let bin_read_safe ~loc ~path (rec_flag, tds) =
+    let tds = List.map tds ~f:name_type_params_in_td in
+    let rec_flag = really_recursive rec_flag tds in
+    (match rec_flag, tds with
+     | Nonrecursive, _ :: _ :: _ ->
+       (* there can be captures in the generated code if we allow this *)
+       Location.raise_errorf ~loc
+         "bin_prot doesn't support multiple nonrecursive definitions."
+     | _ -> ());
+    let can_omit_type_annot = List.for_all tds ~f:would_rather_omit_type_signatures in
+    let vtag_read_bindings, read_and_reader_bindings =
+      List.map tds ~f:(bin_read_td ~can_omit_type_annot ~loc ~path)
+      |> List.unzip
+    in
+    let read_bindings, reader_bindings = List.unzip read_and_reader_bindings in
+    let defs =
+      match rec_flag with
+      | Recursive ->
+        [ pstr_value ~loc Recursive (vtag_read_bindings @ read_bindings) ]
+      | Nonrecursive ->
+        let cnv binding = pstr_value ~loc Nonrecursive [binding] in
+        List.map vtag_read_bindings ~f:cnv @
+        List.map      read_bindings ~f:cnv
+    in
+    defs @ [ pstr_value ~loc Nonrecursive reader_bindings ]
+
+  let gen = Deriving.Generator.make Deriving.Args.empty bin_read_safe
+end
+
 (* Generator for binary protocol type classes *)
 module Generate_tp_class = struct
   let tp_record ~loc ~writer ~reader ~shape =
@@ -1445,11 +1563,12 @@ let bin_read =
     ~str_type_decl:Generate_bin_read.gen
     ~sig_type_decl:Sig.bin_read
 
+(* O(1) addition *)
 let bin_read_safe =
   Deriving.add
     "bin_read_safe"
-    ~str_type_decl:Generate_bin_read.gen
-    ~sig_type_decl:Sig.bin_read
+    ~str_type_decl:Generate_bin_read_safe.gen
+    ~sig_type_decl:Sig.bin_read_safe
 
 let () =
   Deriving.add
@@ -1474,8 +1593,13 @@ let bin_io =
     ~sig_type_decl:[bin_io_named_sig]
     ~str_type_decl:(List.rev set)
 
+(* O(1) additions *)
+let bin_io_named_safe_sig =
+  Deriving.add "bin_io.named_safe_sig.prevent using this in source files"
+    ~sig_type_decl:Sig.named_safe
+
 let bin_io_safe =
   let set = [bin_shape; bin_write; bin_read_safe; bin_type_class] in
   Deriving.add_alias "bin_io_safe" set
-    ~sig_type_decl:[bin_io_named_sig]
+    ~sig_type_decl:[bin_io_named_safe_sig]
     ~str_type_decl:(List.rev set)

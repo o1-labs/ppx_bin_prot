@@ -1255,18 +1255,10 @@ module Generate_bin_read = struct
           match oc_body with
           | `Closed expr ->
             alias_or_fun expr [%expr fun buf ~pos_ref ->
-              (try
-                Ok ([%e expr] buf ~pos_ref)
-              with exn ->
-                Error (Exn.to_string exn))]
+              [%e expr] buf ~pos_ref]
           | `Open body -> [%expr fun buf ~pos_ref ->
-            try
-              Ok ([%e body])
-            with exn ->
-              Error (Exn.to_string exn)
-          ]
+            [%e body]]
       in
-      print_expr "BODY" body;
       let pat = pvar ~loc read_name in
       let pat_with_type =
         match read_binding_type with
@@ -1384,6 +1376,56 @@ module Generate_bin_read = struct
 end
 
 module Generate_bin_read_safe = struct
+  let read_and_vtag_read_bindings ~loc
+      ~read_name ~read_binding_type
+      ~vtag_read_name ~vtag_read_binding_type
+      ~full_type_name ~(td_class : Generate_bin_read.Td_class.t) ~args ~oc_body =
+    let read_binding =
+      let body =
+        match td_class with
+        | Polymorphic_variant _ ->
+          Generate_bin_read.main_body_for_polymorphic_variant ~loc ~vtag_read_name ~full_type_name
+            ~args
+        | Alias_but_not_polymorphic_variant | Other ->
+          match oc_body with
+          | `Closed expr ->
+            alias_or_fun expr [%expr fun buf ~pos_ref ->
+              (try
+                Ok ([%e expr] buf ~pos_ref)
+              with exn ->
+                Error (Exn.to_string exn))]
+          | `Open body -> [%expr fun buf ~pos_ref ->
+            try
+              Ok ([%e body])
+            with exn ->
+              Error (Exn.to_string exn)
+          ]
+      in
+      print_expr "BODY" body;
+      let pat = pvar ~loc read_name in
+      let pat_with_type =
+        match read_binding_type with
+        | None -> pat
+        | Some ty -> ppat_constraint ~loc pat ty
+      in
+      value_binding ~loc
+        ~pat:pat_with_type
+        ~expr:(eabstract ~loc (patts_of_vars args) body)
+    in
+    let vtag_read_binding =
+      let pat = pvar ~loc vtag_read_name in
+      let pat_with_type =
+        match vtag_read_binding_type with
+        | None -> pat
+        | Some ty -> ppat_constraint ~loc pat ty
+      in
+      value_binding ~loc
+        ~pat:pat_with_type
+        ~expr:(eabstract ~loc (patts_of_vars args)
+                 (Generate_bin_read.vtag_reader ~loc ~td_class ~full_type_name ~oc_body))
+    in
+    (read_binding, vtag_read_binding)
+
   let bin_read_td ~can_omit_type_annot ~loc:_ ~path td =
     let full_type_name = Full_type_name.make ~path td in
     let loc = td.ptype_loc in
@@ -1400,7 +1442,7 @@ module Generate_bin_read_safe = struct
     in
     let read_binding, vtag_read_binding =
       let args = vars_of_params td ~prefix:"_of__" in
-      Generate_bin_read.read_and_vtag_read_bindings ~loc ~read_name ~read_binding_type
+      read_and_vtag_read_bindings ~loc ~read_name ~read_binding_type
         ~vtag_read_name ~vtag_read_binding_type
         ~full_type_name ~td_class:(Generate_bin_read.Td_class.of_td td) ~args ~oc_body
     in
